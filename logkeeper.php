@@ -21,7 +21,7 @@ class FileInfo {
 	public $lastUse;
 }
 class LogKeeper {
-	const LOG_REGEX = '/^(?P<IP>\S+) (\S) (.*?) \[([^\]]+)\] "(?P<firstline>.+ .+)" ([0-9]+) ([0-9]+|-) "(.*)" "(?P<Agent>.*)"$/';
+	const LOG_REGEX = '/^(?P<IP>\S+) (\S) (.*?) \[([^\]]+)\] "(?P<firstline>.+ .+)" (?P<httpCode>[0-9]+) ([0-9]+|-) "(.*)" "(?P<Agent>.*)"$/';
 	
 	private $dir;
 	private $fd;
@@ -83,7 +83,7 @@ class LogKeeper {
 				var_dump($line);
 				continue;
 			}
-			if ($this->isStaticFile($matches['firstline'])) {
+			if ($this->isStaticFile($matches['firstline']) or $this->isAdminRequest($matches['firstline']) or in_array($matches['httpCode'], [503, 403]) or $matches['IP'] == "164.132.141.251") {
 				continue;
 			}
 			$this->recordConnectionCount($matches['IP']);
@@ -128,7 +128,11 @@ class LogKeeper {
 		$bads = array(
 			'X11; Ubuntu; Linux x86_64; rv:62.0',
 			'SemrushBot',
-			'HeadlessChrome'
+			'HeadlessChrome',
+			'sogou',
+			'DuckDuckBot',
+			'DotBot',
+			'Yandex',
 		);
 		foreach ($bads as $bad) {
 			if (stripos($log['Agent'], $bad) !== false) {
@@ -192,6 +196,12 @@ class LogKeeper {
 		}
 		$ext = substr($url, $dot + 1);
 		return in_array($ext, ["jpg", "png", "gif", "tff", "woff", "woff2", "eot", "css", "js", "map", "json", "jpeg", "svg", "mp3", "mp4", "mkv", "ico"]);
+	}
+	private function isAdminRequest(string $firstline): bool {
+		$firstline = explode(" ", $firstline, 3);
+		$url = $firstline[1];
+		$url = parse_url($url,  PHP_URL_PATH);
+		return preg_match("/^\/wp-admin\//i", $url);
 	}
 }
 
