@@ -2,10 +2,13 @@
 <?php
 error_reporting(E_ALL);
 ini_set('display_errors', true);
-
+$disabledFunctions = ini_get("disable_functions");
+if (stripos($disabledFunctions, "shell_exec") !== false) {
+	echo "shell_exec is disabled";
+	exit(1);
+}
 if (in_array("install", $_SERVER['argv'])) {
 	if (!extension_loaded("inotify") and in_array("inotify", $_SERVER['argv'])) {
-		$disabledFunctions = ini_get("disable_functions");
 		if ($disabledFunctions) {
 			$ini = php_ini_loaded_file();
 			$contentOrginal = file_get_contents($ini);
@@ -28,7 +31,7 @@ if (in_array("install", $_SERVER['argv'])) {
 	}
 	$content = "[Service]
 Type=simple
-ExecStart=" . realpath($_SERVER['PHP_SELF']) . "
+ExecStart=/usr/local/php72/bin/php -d disable_functions " . realpath($_SERVER['PHP_SELF']) . "
 
 [Install]
 WantedBy=multi-user.target";
