@@ -278,10 +278,10 @@ class LogKeeper {
 	}
 	private function resetFPM() {
 		$log = Log::getInstance();
-		$log->info("service php72-fpm restart");
-		shell_exec("service php72-fpm restart");
-		$log->info("service php56-fpm restart");
-		shell_exec("service php56-fpm restart");
+		$log->info("service php-fpm72 restart");
+		shell_exec("service php-fpm72 restart");
+		$log->info("service php-fpm56 restart");
+		shell_exec("service php-fpm56 restart");
 		$this->fpmErrors = [];
 	}
 	private function checkLogSize() {
