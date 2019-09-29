@@ -123,7 +123,7 @@ class LogKeeper {
 				var_dump($line);
 				continue;
 			}
-			if (in_array($matches['httpCode'], [502, 503, 504])) {
+			if (in_array($matches['httpCode'], [502, 504])) {
 				$log->debug("check fpm, http code: {$matches['httpCode']}");
 				$this->checkFPM($matches['httpCode']);
 			}
