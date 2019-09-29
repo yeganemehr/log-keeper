@@ -4,6 +4,28 @@ error_reporting(E_ALL);
 ini_set('display_errors', true);
 
 if (in_array("install", $_SERVER['argv'])) {
+	if (!extension_loaded("inotify") and in_array("inotify", $_SERVER['argv'])) {
+		$disabledFunctions = ini_get("disable_functions");
+		if ($disabledFunctions) {
+			$ini = php_ini_loaded_file();
+			$contentOrginal = file_get_contents($ini);
+			$content = preg_replace("/^disable_functions\s*=/m", ";$0", $contentOrginal);
+			file_put_contents($ini, $content);
+		}
+		$pecl = "/usr/local/php72/bin/pecl";
+		echo "# {$pecl} install inotify\n";
+		echo shell_exec("{$pecl} install inotify");
+		if (isset($ini, $contentOrginal)) {
+			file_put_contents($ini, $contentOrginal);
+		}
+		$inis = array_map("trim", explode(",", php_ini_scanned_files()));
+		if (isset($inis[0]) and $inis[0]) {
+			$dir = dirname($inis[0]);
+			if (is_dir($dir)) {
+				file_put_contents($dir . "/50-inotify.ini", "extension=inotify.so");
+			}
+		}
+	}
 	$content = "[Service]
 Type=simple
 ExecStart=" . realpath($_SERVER['PHP_SELF']) . "
@@ -34,8 +56,13 @@ class LogKeeper {
 	private $blockedIPs = [];
 	private $changeNginxConfig = false;
 	private $lastRewriteNginxConfig = 0;
+	private $fpmErrors = [];
 	public function __construct(string $dir) {
 		$this->dir = $dir;
+		if (!extension_loaded("inotify")) {
+			error_log("inotify is not running");
+			exit(1);
+		}
 		$this->fd = inotify_init();
 		$this->wd = inotify_add_watch($this->fd, $dir, IN_MODIFY);
 		$this->selfIPs = file("/usr/local/directadmin/data/admin/ip.list", FILE_SKIP_EMPTY_LINES | FILE_IGNORE_NEW_LINES);
@@ -46,8 +73,12 @@ class LogKeeper {
 		
 	}
 	public function __destruct() {
-		inotify_rm_watch($this->fd, $this->wd);
-		fclose($this->fd);
+		if ($this->wd) {
+			inotify_rm_watch($this->fd, $this->wd);
+		}
+		if ($this->fd) {
+			fclose($this->fd);
+		}
 	}
 	public function watch() {
 		while (true) {
@@ -61,10 +92,14 @@ class LogKeeper {
 	}
 
 	private function analizeFile(string $file) {
+		$log = Log::getInstance();
 		$now = time();
 		if ($now - $this->lastReset > 60) {
+			$log->debug("reset ips and fpm errors after " . ($now - $this->lastReset) . " seconds");
 			$this->lastReset = $now;
 			$this->ips = [];
+			$this->fpmErrors = [];
+			$this->checkLogSize();
 		}
 		if (isset($this->files[$file])) {
 			$info = $this->files[$file];
@@ -79,21 +114,45 @@ class LogKeeper {
 		while (($line = stream_get_line($info->fp, 10 * 1024, "\n")) !== false) {
 			$line = trim($line);
 			if (!preg_match(self::LOG_REGEX, $line, $matches)) {
+				$log->error("line doesn't match in regex");
+				$log->reply($line);
 				error_log("line doesn't match in regex");
 				var_dump($line);
 				continue;
 			}
-			if ($this->isStaticFile($matches['firstline']) or $this->isAdminRequest($matches['firstline']) or in_array($matches['httpCode'], [503, 403]) or $matches['IP'] == "164.132.141.251") {
+			if (in_array($matches['httpCode'], [502, 503, 504])) {
+				$log->debug("check fpm, http code: {$matches['httpCode']}");
+				$this->checkFPM($matches['httpCode']);
+			}
+			if ($this->isStaticFile($matches['firstline'])) {
+				$log->debug("static file, skip");
+				continue;
+			}
+			if ($this->isAdminRequest($matches['firstline'])) {
+				$log->debug("admin request, skip");
+				continue;
+			}
+			if (in_array($matches['httpCode'], [500, 502, 503, 504, 403])) {
+				$log->debug("http code: {$matches['httpCode']}, skip");
+				continue;
+			}
+			if ($matches['IP'] == "164.132.141.251") {
+				$log->debug("IP: {$matches['IP']}, skip");
 				continue;
 			}
 			$this->recordConnectionCount($matches['IP']);
 			if (!$this->isBlocked($matches['IP'])) {
 				$reasonToBlock = "";
 				$shouldBlock = null;
-				if ($this->isGoogle($matches) or in_array($matches['IP'], $this->selfIPs)) {
-					$shouldBlock = false;
+				if ($this->isGoogle($matches)) {
+					$log->debug("Google, skip");
+					continue;
 				}
-				if ($shouldBlock === null and $this->isBadBot($matches)) {
+				if (in_array($matches['IP'], $this->selfIPs)) {
+					$log->debug("Local ip: {$matches['IP']}, skip");
+					continue;
+				}
+				if ($this->isBadBot($matches)) {
 					$shouldBlock = true;
 					$reasonToBlock = "User-Agent: {$matches['Agent']}";
 				}
@@ -104,8 +163,11 @@ class LogKeeper {
 				}
 				
 				if ($shouldBlock === true) {
+					$log->info("ip: {$matches['IP']}, {$reasonToBlock}, block");
 					$this->block($matches['IP'], $reasonToBlock);
 				}
+			} else {
+				$log->debug("already blocked: {$matches['IP']}, skip");
 			}
 		}
 		$info->lastUse = $now;
@@ -115,7 +177,6 @@ class LogKeeper {
 	private function block(string $ip, $reasonToBlock) {
 		$now = time();
 		if (!$this->isBlocked($ip)) {
-			echo("Block IP ({$ip}): " . $reasonToBlock . "\n");
 			$this->blocked[$ip] = $now + 3600;
 			$this->changeNginxConfig = true;
 			// echo shell_exec("csf -td {$ip} 3600")."\n";
@@ -164,11 +225,13 @@ class LogKeeper {
 		}
 	}
 	private function rewriteNginxConfig() {
+		$log = Log::getInstance();
 		if (!$this->changeNginxConfig) {
 			return;
 		}
 		$now = time();
 		if ($now - $this->lastRewriteNginxConfig > 120) {
+			$log->debug("rewrite nginx blocked ips");
 			$fp = fopen("/etc/nginx/blocked-ips.conf", "w");
 			foreach ($this->blocked as $ip => $expire) {
 				if ($now - $expire < 0) {
@@ -178,6 +241,7 @@ class LogKeeper {
 				}
 			}
 			fclose($fp);
+			$log->info("nginx -s reload");
 			shell_exec("nginx -s reload")."\n";
 			$this->changeNginxConfig = false;
 			$this->lastRewriteNginxConfig = time();
@@ -203,7 +267,234 @@ class LogKeeper {
 		$url = parse_url($url,  PHP_URL_PATH);
 		return preg_match("/^\/wp-admin\//i", $url);
 	}
+	private function checkFPM(int $statusCode): void {
+		if (!isset($this->fpmErrors[$statusCode])) {
+			$this->fpmErrors[$statusCode] = 0;
+		}
+		$this->fpmErrors[$statusCode]++;
+		if ($this->fpmErrors[$statusCode] > 10) {
+			$this->resetFPM();
+		}
+	}
+	private function resetFPM() {
+		$log = Log::getInstance();
+		$log->info("service php72-fpm restart");
+		shell_exec("service php72-fpm restart");
+		$log->info("service php56-fpm restart");
+		shell_exec("service php56-fpm restart");
+		$this->fpmErrors = [];
+	}
+	private function checkLogSize() {
+		$log = Log::getInstance();
+		$log->info("get log size");
+		$file = Log::getFile();
+		if (!is_file($file)) {
+			return;
+		}
+		$mb = round(filesize($file) / 1024 / 1024, 2);
+		$log->reply($mb . " MB");
+		if ($mb > 100) {
+			$output = $file . "-" . time() . ".gz";
+			$log->info("compress to {$output}");
+			shell_exec("gzip -9 -c {$file} > " . $output);
+			unlink($file);
+		}
+	}
 }
 
+class Log {
+	const debug = 1;
+	const info = 2;
+	const warn = 3;
+	const error = 4;
+	const fatal = 6;
+	const off = 0;
+	static public $quiet = true;
+	static private $parent;
+	static protected $file;
+	static private $generation = 0;
+	static private $indentation = "\t";
+	public static function newChild(){
+		self::$generation++;
+	}
+	public static function dieChild(){
+		self::$generation--;
+	}
+	public static function getParent(){
+		if(!self::$parent){
+			self::$parent = self::getInstance();
+		}
+		return self::$parent;
+	}
+	public static function getInstance(){
+		$level = self::off;
+		if (self::$parent) {
+			$level = self::$parent->getLevel();
+		}
+		return new LogInstance($level);
+	}
+	public static function setFile($file){
+		self::$file = $file;
+	}
+	public static function getFile(){
+		return self::$file;
+	}
+	public static function setLevel($level){
+		switch(strtolower($level)){
+			case('debug'):$level = self::debug;break;
+			case('info'):$level = self::info;break;
+			case('warn'):$level = self::warn;break;
+			case('error'):$level = self::error;break;
+			case('fatal'):$level = self::fatal;break;
+			case('off'):$level = self::off;break;
+		}
+		self::getParent()->setLevel($level);
+	}
+	public static function debug(){
+		return call_user_func_array(array(self::getParent(),'debug'), func_get_args());
+	}
+	public static function info(){
+		return call_user_func_array(array(self::getParent(),'info'), func_get_args());
+	}
+	public static function warn(){
+		return call_user_func_array(array(self::getParent(),'warn'), func_get_args());
+	}
+	public static function error(){
+		return call_user_func_array(array(self::getParent(),'error'), func_get_args());
+	}
+	public static function fatal(){
+		return call_user_func_array(array(self::getParent(),'fatal'), func_get_args());
+	}
+	public static function append(){
+		return call_user_func_array(array(self::getParent(),'append'), func_get_args());
+	}
+	public static function reply(){
+		return call_user_func_array(array(self::getParent(),'reply'), func_get_args());
+	}
+	public static function setIndentation(string $indentation,int $repeat = 1){
+		self::$indentation = str_repeat($indentation,$repeat);
+	}
+	public static function write($level, $message){
+		$microtime = explode(" ",microtime());
+		$date = date("Y-m-d H:i:s.".substr($microtime[0],2)." P");
+		$levelText = '';
+		switch($level){
+			case(self::debug):$levelText = '[DEBUG]';break;
+			case(self::info):$levelText = '[INFO]';break;
+			case(self::warn):$levelText = '[WARN]';break;
+			case(self::error):$levelText = '[ERROR]';break;
+			case(self::fatal):$levelText = '[FATAL]';break;
+		}
+		$line = $date." ".$levelText.(self::$generation > 1 ? str_repeat(self::$indentation, self::$generation-1) : ' ').$message."\n";
+		if (self::$quiet == 0) {
+			echo $line;
+		}
+		file_put_contents(self::$file, $line, is_file(self::$file) ? FILE_APPEND : 0);
+	}
+}
+class LogInstance {
+	protected $level;
+	protected $lastLevel;
+	protected $lastMessage;
+	protected $closed = false;
+	protected $replyCharacter = '';
+	protected $append = false;
+	public function __construct($level){
+		Log::newChild();
+		$this->setLevel($level);
+	}
+	public function __destruct(){
+		$this->end();
+	}
+	public function end(){
+		if(!$this->closed){
+			$this->closed = true;
+			Log::dieChild();
+		}
+	}
+	public function setLevel($level){
+		if(in_array($level, array(
+			Log::debug,
+			Log::info,
+			Log::warn,
+			Log::error,
+			Log::fatal,
+			Log::off,
+		))){
+			$this->level = $level;
+		}
+	}
+	public function getLevel(){
+		return $this->level;
+	}
+	public function debug(){
+		return $this->log(Log::debug,func_get_args());
+	}
+	public function info(){
+		return $this->log(Log::info,func_get_args());
+	}
+	public function warn(){
+		return $this->log(Log::warn,func_get_args());
+	}
+	public function error(){
+		return $this->log(Log::error,func_get_args());
+	}
+	public function fatal(){
+		return $this->log(Log::fatal,func_get_args());
+	}
+	public function log($level, $data){
+		if($data){
+			$check = $this->checkLevel($level);
+			$this->lastLevel = $level;
+			if($check){
+				Log::write($level, $this->createMessage($data));
+			}
+			$this->append = false;
+			$this->replyCharacter = '';
+		}
+		return $this;
+	}
+	public function append(){
+		$this->replyCharacter = '';
+		$this->append = true;
+		return $this->log($this->lastLevel, func_get_args());
+	}
+	public function reply(){
+		$this->replyCharacter = ': ';
+		$this->append = true;
+		return $this->log($this->lastLevel, func_get_args());
+	}
+	private function checkLevel($level){
+		return($this->level and $level >= $this->level);
+	}
+	private function createMessage($args){
+		$message = '';
+		foreach($args as $arg){
+			if($message){
+				$message .= " ";
+			}
+			$type = gettype($arg);
+			if(in_array($type, array('array','object','boolean','NULL'))){
+			    if($type == 'object'){
+			        $arg = (array)$arg;
+			    }
+				$message .= json_encode($arg);
+			}else{
+				$message .= $arg;
+			}
+		}
+		if($this->append){
+			$message = $this->lastMessage.$this->replyCharacter.$message;
+		}
+		$this->lastMessage = $message;
+		return $message;
+	}
+}
+
+
+
+Log::$quiet = false;
+Log::setFile("/var/log/log-keeper.log");
+Log::setLevel(Log::debug);
 $keeper = new LogKeeper("/var/log/nginx/domains");
 $keeper->watch();
